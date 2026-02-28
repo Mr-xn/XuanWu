@@ -3,6 +3,7 @@ package serve
 import (
 	"io"
 	"math"
+	"mime"
 	"os"
 	"path/filepath"
 	"strings"
@@ -96,7 +97,12 @@ func HandlerFileUpload(c *gin.Context) {
 		return
 	}
 
-	dst := filepath.Join(fullPath, file.Filename)
+	safeFilename := filepath.Base(file.Filename)
+	if safeFilename == "." {
+		response.ErrMesage(c, "非法文件名")
+		return
+	}
+	dst := filepath.Join(fullPath, safeFilename)
 	if err := c.SaveUploadedFile(file, dst); err != nil {
 		response.ErrMesage(c, "保存文件失败")
 		return
@@ -139,7 +145,7 @@ func HandlerFileDownload(c *gin.Context) {
 
 	fileName := filepath.Base(path)
 	c.Header("Content-Type", "application/octet-stream")
-	c.Header("Content-Disposition", "attachment; filename="+fileName)
+	c.Header("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": fileName}))
 	c.Writer.Header().Set("Transfer-Encoding", "chunked")
 
 	chunkSize := 1024 * 1024 // 1MB
@@ -300,7 +306,15 @@ func HandlerBatchUpload(c *gin.Context) {
 	}
 
 	for _, file := range files {
-		dst := filepath.Join(fullPath, file.Filename)
+		safeFilename := filepath.Base(file.Filename)
+		if safeFilename == "." {
+			results.Failed = append(results.Failed, UploadResult{
+				Name:  file.Filename,
+				Error: "非法文件名",
+			})
+			continue
+		}
+		dst := filepath.Join(fullPath, safeFilename)
 		if err := c.SaveUploadedFile(file, dst); err != nil {
 			results.Failed = append(results.Failed, UploadResult{
 				Name:  file.Filename,

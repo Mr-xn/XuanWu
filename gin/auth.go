@@ -1,6 +1,7 @@
 package serve
 
 import (
+	"crypto/subtle"
 	"fmt"
 	"strings"
 	"time"
@@ -9,6 +10,11 @@ import (
 
 	"github.com/gin-gonic/gin"
 )
+
+// isSecureRequest 检测当前请求是否通过HTTPS（包括反向代理场景）
+func isSecureRequest(c *gin.Context) bool {
+	return c.Request.TLS != nil || strings.EqualFold(c.GetHeader("X-Forwarded-Proto"), "https")
+}
 
 // ClearUserToken 清除用户token
 func (p *ApiData) ClearUserToken(c *gin.Context) {
@@ -20,7 +26,7 @@ func (p *ApiData) ClearUserToken(c *gin.Context) {
 	}
 
 	// 清除cookie
-	c.SetCookie("cookie", "", -1, "/", "", false, false)
+	c.SetCookie("cookie", "", -1, "/", "", isSecureRequest(c), true)
 }
 
 func (p *ApiData) CookieHandler() gin.HandlerFunc {
@@ -78,13 +84,10 @@ func (p *ApiData) LoginHandle(c *gin.Context) {
 		return
 	}
 	res := GetUserInfo()
-	if res.Username != req.Username { //没有查到用户数据
-		r.ErrMesage(c, "用户名错误")
-		return
-	}
-	//密码在设置时候就加密存储,传过来的参数是sha256,直接比较
-	if res.Password != req.Password {
-		r.ErrMesage(c, "密码错误")
+	usernameMatch := subtle.ConstantTimeCompare([]byte(res.Username), []byte(req.Username))
+	passwordMatch := subtle.ConstantTimeCompare([]byte(res.Password), []byte(req.Password))
+	if usernameMatch != 1 || passwordMatch != 1 {
+		r.ErrMesage(c, "用户名或密码错误")
 		return
 	}
 
@@ -97,7 +100,7 @@ func (p *ApiData) LoginHandle(c *gin.Context) {
 	expireSeconds := GetCookieExpireDays() * 24 * 60 * 60
 
 	//设置cookie
-	c.SetCookie("cookie", str, expireSeconds, "/", "", false, false)
+	c.SetCookie("cookie", str, expireSeconds, "/", "", isSecureRequest(c), true)
 
 	r.OkMesageData(c, "登录成功", gin.H{
 		"token":  str,

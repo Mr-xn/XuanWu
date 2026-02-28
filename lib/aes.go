@@ -4,15 +4,21 @@ import (
 	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
+	crand "crypto/rand"
 	"encoding/base64"
 	"errors"
+	"fmt"
+	"io"
+	"log"
 	"os"
+	"path/filepath"
+	"sync"
 )
 
 //加密过程：
 //  1、处理数据，对数据进行填充，采用PKCS7（当密钥长度不够时，缺几位补几个几）的方式。
-//  2、对数据进行加密，采用AES加密方法中CBC加密模式
-//  3、对得到的加密数据，进行base64加密，得到字符串
+//  2、对数据进行加密，采用AES加密方法中CBC加密模式，使用随机IV
+//  3、对得到的加密数据（IV前缀+密文），进行base64加密，得到字符串
 // 解密过程相反
 
 // pkcs7Padding 填充
@@ -47,37 +53,35 @@ func pkcs7UnPadding(data []byte) ([]byte, error) {
 	return data[:(length - unPadding)], nil
 }
 
-// AesEncrypt 加密
-func AesEncrypt(data []byte, key []byte) ([]byte, error) {
+// AesEncrypt 加密（接受显式IV参数）
+func AesEncrypt(data []byte, key []byte, iv []byte) ([]byte, error) {
 	//创建加密实例
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, err
 	}
-	//判断加密快的大小
+	//判断加密块的大小
 	blockSize := block.BlockSize()
 	//填充
 	encryptBytes := pkcs7Padding(data, blockSize)
 	//初始化加密数据接收切片
 	crypted := make([]byte, len(encryptBytes))
 	//使用cbc加密模式
-	blockMode := cipher.NewCBCEncrypter(block, key[:blockSize])
+	blockMode := cipher.NewCBCEncrypter(block, iv)
 	//执行加密
 	blockMode.CryptBlocks(crypted, encryptBytes)
 	return crypted, nil
 }
 
-// AesDecrypt 解密
-func AesDecrypt(data []byte, key []byte) ([]byte, error) {
+// AesDecrypt 解密（接受显式IV参数）
+func AesDecrypt(data []byte, key []byte, iv []byte) ([]byte, error) {
 	//创建实例
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, err
 	}
-	//获取块的大小
-	blockSize := block.BlockSize()
 	//使用cbc
-	blockMode := cipher.NewCBCDecrypter(block, key[:blockSize])
+	blockMode := cipher.NewCBCDecrypter(block, iv)
 	//初始化解密数据接收切片
 	crypted := make([]byte, len(data))
 	//执行解密
@@ -90,19 +94,26 @@ func AesDecrypt(data []byte, key []byte) ([]byte, error) {
 	return crypted, nil
 }
 
-// EncryptByAes Aes加密 后 base64 再加
+// EncryptByAes Aes加密：生成随机IV，将IV前缀附加到密文，再进行base64编码
 func EncryptByAes(data []byte) (string, error) {
-	// 16,24,32位字符串的话，分别对应AES-128，AES-192，AES-256 加密方法
-	// key不能泄露
-	PwdKey := generateKey()
-	res, err := AesEncrypt(data, PwdKey)
+	PwdKey := getSecretKey()
+
+	// 生成随机IV
+	iv := make([]byte, aes.BlockSize)
+	if _, err := io.ReadFull(crand.Reader, iv); err != nil {
+		return "", fmt.Errorf("生成随机IV失败: %w", err)
+	}
+
+	res, err := AesEncrypt(data, PwdKey, iv)
 	if err != nil {
 		return "", err
 	}
-	return base64.StdEncoding.EncodeToString(res), nil
+	// 将IV前缀附加到密文中
+	result := append(iv, res...)
+	return base64.StdEncoding.EncodeToString(result), nil
 }
 
-// DecryptByAes Aes 解密
+// DecryptByAes Aes解密：从密文中提取IV前缀，再解密
 func DecryptByAes(data string) ([]byte, error) {
 	if data == "" {
 		return nil, errors.New("加密数据不能为空")
@@ -113,29 +124,77 @@ func DecryptByAes(data string) ([]byte, error) {
 		return nil, errors.New("base64解码失败：" + err.Error())
 	}
 
-	if len(dataByte) == 0 || len(dataByte)%aes.BlockSize != 0 {
+	// 数据必须至少包含一个IV块（16字节）加至少一个密文块（16字节）
+	if len(dataByte) < 2*aes.BlockSize || len(dataByte[aes.BlockSize:])%aes.BlockSize != 0 {
 		return nil, errors.New("无效的加密数据长度")
 	}
 
-	// key不能泄露
-	PwdKey := generateKey()
-	return AesDecrypt(dataByte, PwdKey)
+	// 提取IV和密文
+	iv := dataByte[:aes.BlockSize]
+	ciphertext := dataByte[aes.BlockSize:]
+
+	PwdKey := getSecretKey()
+	return AesDecrypt(ciphertext, PwdKey, iv)
 }
 
-// 生成16位字符串
-func generateKey() []byte {
+var (
+	secretKey     []byte
+	secretKeyOnce sync.Once
+)
+
+// getSecretKey 获取AES密钥（懒加载单例）
+func getSecretKey() []byte {
+	secretKeyOnce.Do(func() {
+		secretKey = loadOrCreateSecretKey()
+	})
+	return secretKey
+}
+
+// loadOrCreateSecretKey 从文件加载或生成并持久化一个随机的32字节密钥
+func loadOrCreateSecretKey() []byte {
+	execPath, err := os.Executable()
+	if err != nil {
+		log.Printf("[安全警告] 无法获取可执行文件路径，使用弱密钥: %v", err)
+		return generateFallbackKey()
+	}
+
+	secretPath := filepath.Join(filepath.Dir(execPath), "data", ".secret")
+
+	// 尝试加载已有密钥
+	data, err := os.ReadFile(secretPath)
+	if err == nil && len(data) == 32 {
+		return data
+	}
+
+	// 生成新随机密钥
+	key := make([]byte, 32)
+	if _, err := io.ReadFull(crand.Reader, key); err != nil {
+		log.Printf("[安全警告] 随机密钥生成失败，使用弱密钥: %v", err)
+		return generateFallbackKey()
+	}
+
+	// 持久化密钥
+	if err := os.MkdirAll(filepath.Dir(secretPath), 0700); err != nil {
+		log.Printf("[安全警告] 密钥目录创建失败，重启后密钥将重置: %v", err)
+	} else if err := os.WriteFile(secretPath, key, 0600); err != nil {
+		log.Printf("[安全警告] 密钥持久化失败，重启后密钥将重置: %v", err)
+	}
+
+	return key
+}
+
+// generateFallbackKey 当随机密钥生成失败时，基于可执行文件路径生成密钥（兜底方案）
+func generateFallbackKey() []byte {
 	str, _ := os.Executable()
-	key := make([]byte, 0, 16)
-	if len(str) > 16 {
-		key = append(key, str[:16]...)
+	key := make([]byte, 0, 32)
+	if len(str) > 32 {
+		key = append(key, str[:32]...)
 	} else {
 		key = append(key, str...)
-		remain := 16 - len(str)
+		remain := 32 - len(str)
 		for i := 0; i < remain; i++ {
 			key = append(key, 'A')
 		}
 	}
-
-	// println(string(key))
-	return []byte(key)
+	return key
 }
